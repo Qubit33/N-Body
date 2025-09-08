@@ -22,4 +22,12 @@ Ou hospede no **GitHub Pages** e compartilhe o link.
 
 ---
 
-## 📂 Estrutura do projeto
+---
+
+## ⚙️ Requisitos
+- Navegador moderno com **WebGL2** (Chrome, Edge, Firefox).
+- CPU/GPU razoáveis para simulações com milhares de partículas.
+- (Opcional) Servidor local para evitar restrições de CORS:  
+  ```bash
+  python -m http.server 8000
+
