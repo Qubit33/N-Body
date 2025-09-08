@@ -1,3 +1,5 @@
+![Demonstração da simulação](docs/demo.png)
+
 # 🌌 N-Body — Simulação de corpos gravitacionais (HTML + WebGL)
 
 **Descrição**  
