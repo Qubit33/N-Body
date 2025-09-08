@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>Universo GPU — Galáxia (com Estatísticas)</title>
+<link rel="stylesheet" href="Source/assets/style.css" />
+</head>
+<body>
+<!-- Loading overlay -->
+<div id="loading">
+  <div>Carregando...</div>
+  <div style="margin-top:10px;font-size:16px;">
+    Partículas carregadas: <span id="particleCount">0</span>
+  </div>
+  <div id="loadingBarContainer">
+    <div id="loadingBar"></div>
+  </div>
+</div>
+
+<canvas id="canvas"></canvas>
+<div id="ui">
+  <strong>BIG BANG - By:Qubit</strong>
+  <label>Partículas: <span id="countLabel">65536</span></label>
+  <input id="count" type="range" min="16384" max="262144" step="16384" value="65536">
+  <div>
+    <button id="reset">Reset</button>
+    <span class="small">Pressione R para pausar/continuar</span>
+  </div>
+  <div>
+    <button id="togglePause">Pausar</button>
+    <button id="toggleStats">Alternar Estatísticas</button>
+  </div>
+  <div id="stats" style="display:block">
+    <div class="statRow"><div>Massa total (simulada)</div><div id="stat_mass">—</div></div>
+    <div class="statRow"><div>Tempo de simulação</div><div id="stat_time">0.00 s</div></div>
+    <div class="statRow"><div>Tamanho (escala)</div><div id="stat_scale">—</div></div>
+    <div class="statRow"><div>Quantidade de partículas</div><div id="stat_count">—</div></div>
+    <div class="statRow"><div>Velocidade média</div><div id="stat_vavg">—</div></div>
+    <div class="statRow"><div>Energia cinética (aprox.)</div><div id="stat_ke">—</div></div>
+    <div class="statRow"><div>Centro de massa (x,y)</div><div id="stat_com">—</div></div>
+  </div>
+  <div class="small" style="margin-top:6px">Observação: estatísticas são estimativas calculadas em uma amostra representativa para desempenho.</div>
+</div>
+
+<script>
+/* ============================
+   Utilitários para carregar arquivos
+   ============================ */
+async function fetchText(url){
+  const res = await fetch(url);
+  if(!res.ok) throw new Error(`Falha ao buscar ${url}: ${res.status}`);
+  return await res.text();
+}
+
+/*
+  Formato esperado para include/glsl3.api:
+   Render="include/shaders/render.frag"
+   RenderVS="include/shaders/render.vert"
+   Update="include/shaders/update.frag"
+  (cada par em nova linha, ou qualquer whitespace)
+*/
+async function loadShaderAPI(apiPath){
+  const apiText = await fetchText(apiPath);
+  // extrai pares Key="value"
+  const re = /([A-Za-z0-9_]+)\s*=\s*"([^"]+)"/g;
+  const map = {};
+  let m;
+  while((m = re.exec(apiText)) !== null){
+    map[m[1]] = m[2];
+  }
+  // buscar cada arquivo referido
+  const shaderSources = {};
+  const fetches = [];
+  for(const key of Object.keys(map)){
+    const p = map[key];
+    fetches.push(
+      fetchText(p).then(src => { shaderSources[key] = src; })
+      .catch(err => { throw new Error(`Erro carregando shader ${p} (chave ${key}): ${err.message}`); })
+    );
+  }
+  await Promise.all(fetches);
+  return shaderSources;
+}
+
+/* ============================
+   WebGL setup
+   ============================ */
+const canvas = document.getElementById('canvas');
+const gl = canvas.getContext('webgl2');
+if(!gl){ alert('WebGL2 não suportado'); throw new Error('WebGL2 não disponível'); }
+if(!gl.getExtension('EXT_color_buffer_float')){
+  alert('EXT_color_buffer_float não suportado!');
+  throw new Error('EXT_color_buffer_float necessário');
+}
+
+/* variáveis de runtime */
+let PARTICLE_TEXTURE_SIZE = 256;
+let particleCount = PARTICLE_TEXTURE_SIZE*PARTICLE_TEXTURE_SIZE;
+let paused=false;
+let simTime = 0.0;
+
+function resize(){
+  const dpr = Math.max(1, window.devicePixelRatio||1);
+  canvas.width = Math.floor(innerWidth*dpr);
+  canvas.height = Math.floor(innerHeight*dpr);
+  gl.viewport(0,0,canvas.width,canvas.height);
+}
+addEventListener('resize', resize);
+resize();
+
+/* UI bindings */
+const ui={
+  count: document.getElementById('count'),
+  countLabel: document.getElementById('countLabel'),
+  reset: document.getElementById('reset')
+};
+function updateLabels(){ ui.countLabel.textContent=particleCount; }
+ui.count.addEventListener('input', ()=>{ recreateWithProgress(parseInt(ui.count.value)); updateLabels(); });
+ui.reset.addEventListener('click', ()=>recreateWithProgress(particleCount));
+updateLabels();
+
+const pauseButton = document.getElementById('togglePause');
+const statsToggle = document.getElementById('toggleStats');
+const statsPanel = document.getElementById('stats');
+function updatePauseButton() {
+    if(paused){
+        pauseButton.textContent = "Continuar";
+        pauseButton.classList.remove('running');
+        pauseButton.classList.add('paused');
+    } else {
+        pauseButton.textContent = "Pausar";
+        pauseButton.classList.remove('paused');
+        pauseButton.classList.add('running');
+    }
+}
+updatePauseButton();
+pauseButton.addEventListener('click', ()=>{ paused = !paused; updatePauseButton(); });
+statsToggle.addEventListener('click', ()=>{ statsPanel.style.display = statsPanel.style.display === 'none' ? 'block' : 'none'; });
+window.addEventListener('keydown', e=>{ if(e.key.toLowerCase() === 'r'){ paused = !paused; updatePauseButton(); } });
+
+/* ============================
+   Shader/program utilities (cache)
+   ============================ */
+const shaderCache = new Map();
+function getShader(gl, type, src){
+    const key = type + '::' + src.slice(0,120); // pequeno fingerprint para cache
+    if(shaderCache.has(key)) return shaderCache.get(key);
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, src);
+    gl.compileShader(shader);
+    if(!gl.getShaderParameter(shader, gl.COMPILE_STATUS)){
+        console.error('Shader source:\n', src);
+        console.error(gl.getShaderInfoLog(shader));
+        throw new Error('Shader compile error');
+    }
+    shaderCache.set(key, shader);
+    return shader;
+}
+function createProgramCached(gl, vsSrc, fsSrc){
+    const key = 'prog::' + (vsSrc.slice(0,80)) + '||' + (fsSrc.slice(0,80));
+    if(shaderCache.has(key)) return shaderCache.get(key);
+    const program = gl.createProgram();
+    gl.attachShader(program, getShader(gl, gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(program, getShader(gl, gl.FRAGMENT_SHADER, fsSrc));
+    gl.linkProgram(program);
+    if(!gl.getProgramParameter(program, gl.LINK_STATUS)){
+        console.error(gl.getProgramInfoLog(program));
+        throw new Error('Program link error');
+    }
+    shaderCache.set(key, program);
+    return program;
+}
+
+/* Quad VS (mantive inline) */
+const quadVS = `#version 300 es
+in vec2 a_pos; out vec2 v_uv;
+void main(){ v_uv=a_pos*0.5+0.5; gl_Position=vec4(a_pos,0,1); }`;
+
+/* Render VS (mantive inline — você pode mover para arquivo se preferir) */
+const renderVS = `#version 300 es
+in vec2 a_uv;
+uniform sampler2D u_posTex; 
+uniform sampler2D u_colorTex;
+uniform float u_pointSize; 
+out vec3 v_color;
+void main(){
+  vec2 pos = texture(u_posTex,a_uv).rg;
+  v_color = texture(u_colorTex,a_uv).rgb;
+  gl_Position = vec4(pos*0.15,0,1);
+  gl_PointSize = u_pointSize;
+}`;
+
+/* placeholders — serão substituídos pelos conteúdos carregados */
+let updateFS = null;
+let renderFS = null;
+
+/* Pré-criação de programas será chamada APÓS carregar os shaders externos */
+let updateProgram = null;
+let renderProgram = null;
+
+/* Quad VAO */
+const quadVAO=gl.createVertexArray();
+gl.bindVertexArray(quadVAO);
+const quadVBO=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,quadVBO);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+// atributo a_pos será configurado após criar updateProgram (pois requer localização do atributo no program)
+gl.bindVertexArray(null);
+
+/* Texturas / ping-pong / VAO de partículas */
+let posTexA,posTexB,velTexA,velTexB,colorTex,particleVAO,particleUVsVBO;
+let ping={readPos:null,writePos:null,readVel:null,writeVel:null};
+let fboPosA, fboPosB;
+
+/* cria textura float RGBA32F */
+function createFloatTexture(w,h,data=null){
+  const tex=gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,w,h,0,gl.RGBA,gl.FLOAT,data);
+  return tex;
+}
+
+/* Loading UI helpers */
+const loadingBar = document.getElementById('loadingBar');
+const particleCountDisplay = document.getElementById('particleCount');
+function setLoadingProgress(p, count=null){ loadingBar.style.width = (p*100)+'%'; if(count !== null) particleCountDisplay.textContent = count; }
+
+/* Estatísticas (amostra representativa) */
+let sampleIndices = null;
+let sampleCount = 2048;
+let samplePos = null, sampleVel = null, sampleMass = null;
+
+function pickSampleIndices(textureSize, desiredSample){
+  const total = textureSize * textureSize;
+  const S = Math.min(desiredSample, total);
+  const indices = new Uint32Array(S);
+  const step = Math.max(1, Math.floor(total / S));
+  let p=0;
+  for(let i=0;i<total && p<S;i+=step) indices[p++]=i;
+  while(p<S) indices[p++]=Math.floor(Math.random()*total);
+  return indices;
+}
+
+/* Inicialização das texturas com progresso */
+function initTexturesWithProgress(size){
+    PARTICLE_TEXTURE_SIZE = size;
+    particleCount = size*size;
+
+    const posData = new Float32Array(size*size*4);
+    const velData = new Float32Array(size*size*4);
+    const colorData = new Float32Array(size*size*4);
+
+    for(let i=0;i<size*size;i++){
+        const radius = Math.pow(Math.random(),0.6) * 4.0 + 0.1;
+        const angle = Math.random() * Math.PI * 2;
+        posData[i*4+0] = Math.cos(angle) * radius;
+        posData[i*4+1] = Math.sin(angle) * radius;
+        velData[i*4+0] = -posData[i*4+1]/radius * Math.sqrt(0.1/radius);
+        velData[i*4+1] = posData[i*4+0]/radius * Math.sqrt(0.1/radius);
+        const type=Math.random();
+        if(type<0.25){colorData[i*4+0]=1;colorData[i*4+1]=0.9;colorData[i*4+2]=0.7;}
+        else if(type<0.5){colorData[i*4+0]=1;colorData[i*4+1]=1;colorData[i*4+2]=1;}
+        else if(type<0.75){colorData[i*4+0]=0.7;colorData[i*4+1]=0.8;colorData[i*4+2]=1;}
+        else{colorData[i*4+0]=1;colorData[i*4+1]=0.6;colorData[i*4+2]=0.6;}
+        colorData[i*4+3]=1;
+
+        if(i % 1024 === 0 || i===size*size-1) setLoadingProgress(i/(size*size), i);
+    }
+
+    posTexA=createFloatTexture(size,size,posData);
+    velTexA=createFloatTexture(size,size,velData);
+    posTexB=createFloatTexture(size,size,posData);
+    velTexB=createFloatTexture(size,size,velData);
+    colorTex=createFloatTexture(size,size,colorData);
+    ping.readPos=posTexA; ping.writePos=posTexB;
+    ping.readVel=velTexA; ping.writeVel=velTexB;
+
+    fboPosA = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fboPosA);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,posTexA,0);
+    fboPosB = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fboPosB);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,posTexB,0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+
+    // inicializar amostra representativa (posições/velocidades em CPU)
+    sampleIndices = pickSampleIndices(size, sampleCount);
+    sampleCount = sampleIndices.length;
+    samplePos = new Float32Array(sampleCount*2);
+    sampleVel = new Float32Array(sampleCount*2);
+    sampleMass = new Float32Array(sampleCount);
+    // popular com dados iniciais (mesmos geradores usados acima)
+    for(let s=0;s<sampleCount;s++){
+      const idx = sampleIndices[s];
+      samplePos[s*2+0] = posData[idx*4+0];
+      samplePos[s*2+1] = posData[idx*4+1];
+      sampleVel[s*2+0] = velData[idx*4+0];
+      sampleVel[s*2+1] = velData[idx*4+1];
+      sampleMass[s] = 0.5 + Math.random()*1.5;
+    }
+}
+
+function initParticleVAO(size){
+  if(particleUVsVBO) gl.deleteBuffer(particleUVsVBO);
+  if(particleVAO) gl.deleteVertexArray(particleVAO);
+  const uvs=new Float32Array(size*size*2);
+  let ptr=0;
+  for(let j=0;j<size;j++){
+    for(let i=0;i<size;i++){
+      uvs[ptr++]=(i+0.5)/size;
+      uvs[ptr++]=(j+0.5)/size;
+    }
+  }
+  particleUVsVBO=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,particleUVsVBO);
+  gl.bufferData(gl.ARRAY_BUFFER,uvs,gl.STATIC_DRAW);
+  particleVAO=gl.createVertexArray();
+  gl.bindVertexArray(particleVAO);
+  gl.bindBuffer(gl.ARRAY_BUFFER,particleUVsVBO);
+  const a_uv=gl.getAttribLocation(renderProgram,'a_uv');
+  gl.enableVertexAttribArray(a_uv);
+  gl.vertexAttribPointer(a_uv,2,gl.FLOAT,false,0,0);
+  gl.bindVertexArray(null);
+}
+
+/* Função para (re)criar partículas com progresso e esconder loading */
+async function recreateWithProgress(desiredCount){
+    const approx=Math.ceil(Math.sqrt(desiredCount));
+    const s=Math.pow(2,Math.ceil(Math.log2(approx)));
+
+    initTexturesWithProgress(s);
+    initParticleVAO(s);
+    particleCount=s*s;
+
+    setLoadingProgress(1, particleCount);
+    await new Promise(r=>setTimeout(r,200));
+    document.getElementById('loading').style.display='none';
+    simTime = 0.0;
+    requestAnimationFrame(step);
+}
+
+/* Ping-pong swap */
+function swapPing(){ 
+  [ping.readPos,ping.writePos]=[ping.writePos,ping.readPos];
+  [ping.readVel,ping.writeVel]=[ping.writeVel,ping.readVel];
+}
+
+/* Loop principal */
+let last=performance.now();
+function step(time){
+  let now=time;
+  let dt=(now-last)/1000.;
+  last=now;
+  if(dt>0.05) dt=0.05;
+
+  if(!paused){
+    // atualizar GPU
+    const fbo = ping.readPos===posTexA ? fboPosB : fboPosA;
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+    gl.viewport(0,0,PARTICLE_TEXTURE_SIZE,PARTICLE_TEXTURE_SIZE);
+    gl.useProgram(updateProgram);
+    gl.bindVertexArray(quadVAO);
+
+    // bind de input textures
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,ping.readPos);
+    gl.uniform1i(gl.getUniformLocation(updateProgram,'u_pos'),0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,ping.readVel);
+    gl.uniform1i(gl.getUniformLocation(updateProgram,'u_vel'),1);
+    gl.uniform1f(gl.getUniformLocation(updateProgram,'u_dt'),dt);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+    swapPing();
+
+    // Atualizar amostra no CPU com a mesma física (aproximação)
+    for(let s=0;s<sampleCount;s++){
+      let px = samplePos[s*2+0];
+      let py = samplePos[s*2+1];
+      let vx = sampleVel[s*2+0];
+      let vy = sampleVel[s*2+1];
+      let r = Math.hypot(px,py) + 1e-6;
+      let ax = -px / (r*r*0.1);
+      let ay = -py / (r*r*0.1);
+      vx += ax * dt;
+      vy += ay * dt;
+      px += vx * dt;
+      py += vy * dt;
+      if(r > 5.0){ px *= 0.5; py *= 0.5; vx *= -0.3; vy *= -0.3; }
+      samplePos[s*2+0]=px; samplePos[s*2+1]=py; sampleVel[s*2+0]=vx; sampleVel[s*2+1]=vy;
+    }
+
+    simTime += dt;
+  }
+
+  // Render
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.clearColor(0,0,0,1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE);
+  gl.useProgram(renderProgram);
+  gl.bindVertexArray(particleVAO);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,ping.readPos);
+  gl.uniform1i(gl.getUniformLocation(renderProgram,'u_posTex'),0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,colorTex);
+  gl.uniform1i(gl.getUniformLocation(renderProgram,'u_colorTex'),1);
+  gl.uniform1f(gl.getUniformLocation(renderProgram,'u_pointSize'),Math.max(1,(canvas.height/800)*1.8));
+  gl.uniform1f(gl.getUniformLocation(renderProgram,'u_time'), performance.now()/1000);
+  gl.drawArrays(gl.POINTS,0,particleCount);
+  gl.bindVertexArray(null);
+
+  // Atualizar e exibir estatísticas
+  updateAndDisplayStats();
+
+  requestAnimationFrame(step);
+}
+
+/* Estatísticas */
+function formatNumber(x, digits=3){
+  if(!isFinite(x)) return '—';
+  if(Math.abs(x) >= 1e6) return x.toExponential(digits);
+  if(Math.abs(x) < 1e-3 && x !== 0) return x.toExponential(digits);
+  return x.toFixed(digits);
+}
+function updateAndDisplayStats(){
+  if(!samplePos) return;
+  let mTotal = 0.0;
+  let vxSum = 0.0, vySum = 0.0;
+  let speedSum = 0.0;
+  let keSum = 0.0;
+  let comX = 0.0, comY = 0.0;
+  for(let s=0;s<sampleCount;s++){
+    const m = sampleMass[s];
+    const px = samplePos[s*2+0];
+    const py = samplePos[s*2+1];
+    const vx = sampleVel[s*2+0];
+    const vy = sampleVel[s*2+1];
+    const speed2 = vx*vx + vy*vy;
+    mTotal += m;
+    vxSum += vx * m;
+    vySum += vy * m;
+    speedSum += Math.sqrt(speed2) * m;
+    keSum += 0.5 * m * speed2;
+    comX += px * m;
+    comY += py * m;
+  }
+  const massTotal_simulated = mTotal * (particleCount / sampleCount);
+  const vAvg = (speedSum / mTotal);
+  const keTotal = keSum * (particleCount / sampleCount);
+  const comx = comX / mTotal;
+  const comy = comY / mTotal;
+
+  document.getElementById('stat_mass').textContent = formatNumber(massTotal_simulated,3) + ' u (sim)';
+  document.getElementById('stat_time').textContent = formatNumber(simTime,2) + ' s';
+  document.getElementById('stat_scale').textContent = formatNumber(PARTICLE_TEXTURE_SIZE,0) + ' texSize';
+  document.getElementById('stat_count').textContent = particleCount.toLocaleString();
+  document.getElementById('stat_vavg').textContent = formatNumber(vAvg,4) + ' units/s';
+  document.getElementById('stat_ke').textContent = formatNumber(keTotal,3) + ' (arb)';
+  document.getElementById('stat_com').textContent = formatNumber(comx,3) + ', ' + formatNumber(comy,3);
+}
+
+/* ============================
+   Inicialização de shaders via include/glsl3.api
+   ============================ */
+async function initializeAll(){
+  try{
+    // Carrega o arquivo API que lista os caminhos dos shaders
+    const shaderMap = await loadShaderAPI('include/glsl3.api');
+    // Espera que chaves esperadas existam e pega os conteúdos
+    // Suporta nomes: Update, Render, RenderVS (ou RenderVert), etc. Seja flexível:
+    updateFS = shaderMap.Update || shaderMap.UpdateFS || shaderMap.UPDATE;
+    renderFS = shaderMap.Render || shaderMap.RenderFS || shaderMap.RENDER;
+    const renderVS_external = shaderMap.RenderVS || shaderMap.RenderVert || shaderMap.RenderVert || shaderMap.RenderVertex;
+
+    // se houver um renderVS externo, substitui o inline
+    if(renderVS_external) {
+      // preferir externo
+      // Observação: se o shader externo usar nomes de atributo diferentes, ajuste seu código
+      // aqui para procurar atributos corretos.
+      // Para simplicidade, vamos assumir que o external renderVS define 'in vec2 a_uv;' etc.
+      // Mas mantemos o inline se não houver.
+      // (Substituição:)
+      // renderVS = renderVS_external; // não reatribuir const; usamos variável indireta:
+      // para tornar simples, criaremos renderProgram usando o renderVS_external abaixo.
+    }
+
+    // Verificação básica
+    if(!updateFS) throw new Error('Shader de update não encontrado no include/glsl3.api (chaves: Update).');
+    if(!renderFS) throw new Error('Shader de render não encontrado no include/glsl3.api (chaves: Render).');
+
+    // Criar programas agora (se houver renderVS_external use-o, senão use o inline renderVS)
+    const usedRenderVS = renderVS_external || renderVS;
+
+    // criar programas e cache
+    updateProgram = createProgramCached(gl, quadVS, updateFS);
+    renderProgram = createProgramCached(gl, usedRenderVS, renderFS);
+
+    // configurar atributo do quad (agora que updateProgram existe)
+    gl.bindVertexArray(quadVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER,quadVBO);
+    const a_pos = gl.getAttribLocation(updateProgram,'a_pos');
+    if(a_pos >= 0){
+      gl.enableVertexAttribArray(a_pos);
+      gl.vertexAttribPointer(a_pos,2,gl.FLOAT,false,0,0);
+    } else {
+      console.warn('a_pos attribute não encontrado no updateProgram (verifique seu vertex shader).');
+    }
+    gl.bindVertexArray(null);
+
+    // Inicializa inicialmente as partículas (usa valor do slider)
+    await recreateWithProgress(parseInt(ui.count.value));
+
+  }catch(err){
+    console.error('Erro na inicialização:', err);
+    alert('Erro ao inicializar shaders: ' + err.message);
+  }
+}
+
+/* start */
+initializeAll();
+</script>
+</body>
+</html>
