@@ -1,6 +1,6 @@
-![Demonstração da simulação](https://i.ibb.co/PsHNzNgq/Screenshot-20250906-110137-Treb-Edit.jpg)
-
 # 🌌 N-Body — Simulação de corpos gravitacionais (HTML + WebGL)
+
+![Demonstração da simulação](https://i.ibb.co/PsHNzNgq/Screenshot-20250906-110137-Treb-Edit.jpg)
 
 **Descrição**  
 Simulação N-Body em HTML/JavaScript com renderização por GPU (WebGL/WebGL2).  
